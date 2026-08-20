@@ -1,0 +1,73 @@
+name: ROCm 7.14 GPU visibility diagnostic (AMD)
+
+# Bring-up harness, test branch only. The 7.14 image starts fine on the AMD
+# runners but torch inside it reports no device, while the same image sees all
+# 8 GPUs on a local MI300X box. This compares it against a known-good rocm720
+# image on the same runner to separate "image is wrong" from "runner driver is
+# too old for the 7.14 runtime".
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - bingxche/rocm714-ci-test
+    paths:
+      - .github/workflows/rocm714-gpu-diag.yml
+
+concurrency:
+  group: rocm714-gpu-diag-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  diag:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: linux-mi300-1gpu-sglang
+    environment: 'prod'
+    steps:
+      - name: Host view
+        run: |
+          echo "=== kernel / driver ==="
+          uname -r
+          cat /sys/module/amdgpu/version 2>/dev/null || echo "(no /sys/module/amdgpu/version)"
+          echo "=== KFD topology ==="
+          ls /sys/class/kfd/kfd/topology/nodes/ 2>/dev/null || echo "(no kfd topology)"
+          for n in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+            echo "--- $n"; grep -E '^(gfx_target_version|simd_count)' "$n" 2>/dev/null || true
+          done
+          echo "=== device nodes ==="
+          ls -l /dev/kfd /dev/dri 2>&1 || true
+          echo "=== podinfo render devices ==="
+          cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "(no /etc/podinfo/gha-render-devices)"
+          echo "=== host rocm-smi driver version ==="
+          rocm-smi --showdriverversion 2>&1 | head -20 || true
+
+      - name: Container view (ROCm 7.14 image)
+        run: |
+          docker pull bingxche/sgl-test:v0.5.17-rocm714-mi30x-20260820
+          DEVICE_FLAG="--device /dev/dri"
+          [ -f /etc/podinfo/gha-render-devices ] && DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          echo "DEVICE_FLAG=${DEVICE_FLAG}"
+          docker run --rm --user root --device=/dev/kfd ${DEVICE_FLAG} \
+            --group-add video --security-opt seccomp=unconfined --ipc=host \
+            bingxche/sgl-test:v0.5.17-rocm714-mi30x-20260820 bash -lc '
+              echo "--- devices visible in container ---"; ls -l /dev/kfd /dev/dri 2>&1 | head
+              echo "--- torch ---"
+              python3 -c "import torch; print(\"hip\", torch.version.hip); print(\"count\", torch.cuda.device_count()); print(\"available\", torch.cuda.is_available())"
+              echo "--- rocminfo agents ---"
+              /opt/rocm/bin/rocminfo 2>&1 | grep -E "Agent |Name:|Marketing|gfx" | head -20 || echo "rocminfo failed rc=$?"
+              echo "--- amd-smi ---"
+              amd-smi static -g 0 2>&1 | head -10 || true
+            ' 2>&1 || echo "container run exited rc=$?"
+
+      - name: Container view (known-good ROCm 7.2 image, for comparison)
+        if: always()
+        run: |
+          REF=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'rocm(720|724)-mi30x' | head -1)
+          if [ -z "$REF" ]; then echo "No cached rocm720/724 image on this runner; skipping comparison"; exit 0; fi
+          echo "Comparing against ${REF}"
+          DEVICE_FLAG="--device /dev/dri"
+          [ -f /etc/podinfo/gha-render-devices ] && DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          docker run --rm --user root --device=/dev/kfd ${DEVICE_FLAG} \
+            --group-add video --security-opt seccomp=unconfined --ipc=host \
+            "$REF" bash -lc '
+              python3 -c "import torch; print(\"hip\", torch.version.hip); print(\"count\", torch.cuda.device_count())"
+            ' 2>&1 || echo "container run exited rc=$?"
